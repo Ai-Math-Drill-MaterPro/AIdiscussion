@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Debate</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111;color:#eee}
+main{max-width:900px;margin:auto;padding:20px}
+h1{margin-top:0}
+input,textarea,button{width:100%;padding:12px;margin:5px 0;border-radius:8px;border:1px solid #444;background:#1d1d1d;color:#fff;font-size:15px}
+textarea{min-height:100px;resize:vertical}
+button{cursor:pointer;background:#333}
+button:hover{background:#444}
+button.start{background:#2563eb}
+button.stop{background:#b91c1c}
+button.delete{background:#555}
+.card{background:#181818;border:1px solid #333;border-radius:12px;padding:15px;margin:12px 0}
+.row{display:flex;gap:10px}
+.row>*{flex:1}
+.person{border:1px solid #333;border-radius:10px;padding:12px;margin:8px 0}
+.chat{height:500px;overflow-y:auto;overflow-x:hidden;background:#0b0b0b;border-radius:12px;padding:12px;scroll-behavior:smooth}
+.msg{padding:12px;margin:8px 0;border-radius:10px;background:#191919;word-break:break-word}
+.msg b{display:block;margin-bottom:6px}
+.status{font-size:14px;color:#aaa}
+#timer{font-size:28px;text-align:center;margin:10px}
+</style>
+</head>
+<body>
+<main>
+<h1>AI Debate</h1>
+<div class="card">
+<label>APIキー</label>
+<div id="keys"></div>
+<button onclick="addKey()">APIキーを追加</button>
+</div>
+<div class="card">
+<label>AI人数</label>
+<input id="count" type="number" min="1" max="20" value="2" onchange="makePersons()">
+<div id="persons"></div>
+</div>
+<div class="card">
+<label>議題</label>
+<textarea id="topic" placeholder="例：AIは人間の仕事を奪うべきか"></textarea>
+<div class="row">
+<div>
+<label>議論時間（分）</label>
+<input id="minutes" type="number" min="0.1" step="0.1" value="5">
+</div>
+<div>
+<label>1回の発言文字数</label>
+<input id="length" type="number" min="20" max="2000" value="300">
+</div>
+</div>
+<button class="start" onclick="startDebate()">議論開始</button>
+<button class="stop" onclick="stopDebate()">全員停止</button>
+<button class="delete" onclick="deleteConversation()">会話を削除</button>
+</div>
+<div id="timer">00:00</div>
+<div class="status" id="status">待機中</div>
+<div class="card">
+<div id="chat" class="chat"></div>
+</div>
+</main>
+<script>
+const MODEL="gemini-3.5-flash-lite";
+let keys=[];
+let people=[];
+let history=[];
+let running=false;
+let startTime=0;
+let timerId=null;
+let current=0;
+let controller=null;
+function load(){
+keys=JSON.parse(localStorage.getItem("gemini_keys")||"[]");
+if(!keys.length){
+keys=[""];
+}
+renderKeys();
+makePersons();
+}
+function saveKeys(){
+localStorage.setItem("gemini_keys",JSON.stringify(keys));
+}
+function renderKeys(){
+const box=document.getElementById("keys");
+box.innerHTML="";
+keys.forEach((key,i)=>{
+const div=document.createElement("div");
+div.className="row";
+const input=document.createElement("input");
+input.type="password";
+input.value=key;
+input.placeholder="Gemini API Key";
+const button=document.createElement("button");
+button.textContent="削除";
+button.style.maxWidth="80px";
+button.onclick=()=>removeKey(i);
+input.oninput=()=>{
+keys[i]=input.value;
+saveKeys();
+};
+div.appendChild(input);
+div.appendChild(button);
+box.appendChild(div);
+});
+}
+function addKey(){
+keys.push("");
+saveKeys();
+renderKeys();
+}
+function removeKey(i){
+keys.splice(i,1);
+if(!keys.length){
+keys.push("");
+}
+saveKeys();
+renderKeys();
+}
+function makePersons(){
+const n=Math.max(
+1,
+Math.min(
+20,
+Number(document.getElementById("count").value)||1
+)
+);
+const old=people;
+people=[];
+for(let i=0;i<n;i++){
+people.push({
+name:old[i]?.name||`AI ${i+1}`,
+position:old[i]?.position||"自由な立場で議論する"
+});
+}
+renderPersons();
+}
+function renderPersons(){
+const box=document.getElementById("persons");
+box.innerHTML="";
+people.forEach((p,i)=>{
+const div=document.createElement("div");
+div.className="person";
+const row=document.createElement("div");
+row.className="row";
+const name=document.createElement("input");
+name.value=p.name;
+name.placeholder="AI名";
+const position=document.createElement("input");
+position.value=p.position;
+position.placeholder="立場・人格";
+name.oninput=()=>{
+people[i].name=name.value;
+};
+position.oninput=()=>{
+people[i].position=position.value;
+};
+row.appendChild(name);
+row.appendChild(position);
+div.appendChild(row);
+box.appendChild(div);
+});
+}
+function escapeHtml(s){
+return String(s)
+.replaceAll("&","&amp;")
+.replaceAll("<","&lt;")
+.replaceAll(">","&gt;")
+.replaceAll('"',"&quot;")
+.replaceAll("'","&#039;");
+}
+function addMessage(name,text){
+const box=document.getElementById("chat");
+const div=document.createElement("div");
+div.className="msg";
+div.innerHTML=
+`<b>${escapeHtml(name)}</b>${escapeHtml(text)
+.replaceAll("\n","<br>")}`;
+box.appendChild(div);
+box.scrollTop=box.scrollHeight;
+}
+function elapsed(){
+return Date.now()-startTime;
+}
+function updateTimer(){
+if(!running)return;
+const total=
+Number(document.getElementById("minutes").value)*60000;
+const left=Math.max(
+0,
+total-elapsed()
+);
+const sec=Math.floor(left/1000);
+const m=Math.floor(sec/60);
+const s=sec%60;
+document.getElementById("timer").textContent=
+`${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+if(left<=0){
+finishDebate();
+}
+}
+async function ask(key,person,prompt){
+controller=new AbortController();
+const res=await fetch(
+`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+{
+method:"POST",
+headers:{
+"Content-Type":"application/json",
+"x-goog-api-key":key
+},
+signal:controller.signal,
+body:JSON.stringify({
+systemInstruction:{
+parts:[{
+text:
+`あなたは「${person.name}」という議論参加者です。
+あなたの立場・人格：
+${person.position}
+議論では相手の発言をよく読み、
+単なる同意ではなく必要なら反論してください。
+論点を掘り下げ、
+具体例や理由を提示してください。
+相手を尊重しつつ、
+議論として成立する発言をしてください。
+議題から脱線しないでください。
+${people.length===1
+?"あなたはユーザーと直接議論しています。"
+:"あなたはAI同士の議論に参加しています。"}`
+}]
+},
+contents:[
+{
+role:"user",
+parts:[
+{
+text:prompt
+}
+]
+}
+],
+generationConfig:{
+maxOutputTokens:
+Math.max(
+100,
+Number(document.getElementById("length").value)||300
+),
+thinkingConfig:{
+thinkingLevel:"minimal"
+}
+}
+})
+}
+);
+if(!res.ok){
+throw new Error(await res.text());
+}
+const data=await res.json();
+controller=null;
+return data
+.candidates?.[0]
+?.content
+?.parts
+?.map(x=>x.text||"")
+.join("")||"";
+}
+function buildPrompt(){
+const topic=
+document.getElementById("topic").value.trim();
+let text=
+`議題：
+${topic}
+これまでの議論：
+`;
+for(const h of history){
+text+=`\n${h.name}: ${h.text}`;
+}
+if(people.length===1){
+text+=`
+あなたはユーザーと議論しています。
+これまでの議論を踏まえて、
+次に述べるべき発言をしてください。`;
+}else{
+text+=`
+次の参加者として議論を続けてください。
+直前の発言だけに反応するのではなく、
+これまでの議論全体を踏まえてください。`;
+}
+return text;
+}
+async function nextTurn(){
+if(!running)return;
+const limit=
+Number(document.getElementById("minutes").value)*60000;
+if(elapsed()>=limit){
+finishDebate();
+return;
+}
+const person=people[current];
+const usableKeys=
+keys.filter(x=>x.trim());
+if(!usableKeys.length){
+document.getElementById("status").textContent=
+"APIキーを入力してください";
+running=false;
+return;
+}
+const key=
+usableKeys[current%usableKeys.length];
+document.getElementById("status").textContent=
+`${person.name} が考えています...`;
+try{
+const text=await ask(
+key,
+person,
+buildPrompt()
+);
+if(!running)return;
+if(text){
+history.push({
+name:person.name,
+text:text
+});
+addMessage(
+person.name,
+text
+);
+}
+current=
+(current+1)%people.length;
+if(running){
+setTimeout(nextTurn,0);
+}
+}catch(e){
+if(e.name==="AbortError"){
+return;
+}
+addMessage(
+"SYSTEM",
+"エラー: "+e.message
+);
+document.getElementById("status").textContent=
+"エラー";
+running=false;
+}
+}
+function startDebate(){
+if(running)return;
+const topic=
+document.getElementById("topic").value.trim();
+if(!topic){
+alert("議題を入力してください");
+return;
+}
+if(!keys.some(x=>x.trim())){
+alert("APIキーを入力してください");
+return;
+}
+people=people.map((p,i)=>({
+name:p.name.trim()||`AI ${i+1}`,
+position:p.position.trim()||
+"自由な立場で議論する"
+}));
+history=[];
+current=0;
+running=true;
+startTime=Date.now();
+document.getElementById("chat").innerHTML="";
+document.getElementById("status").textContent=
+"議論中";
+clearInterval(timerId);
+timerId=setInterval(
+updateTimer,
+100
+);
+nextTurn();
+}
+function stopDebate(){
+running=false;
+if(controller){
+controller.abort();
+controller=null;
+}
+clearInterval(timerId);
+document.getElementById("status").textContent=
+"全員停止";
+}
+function deleteConversation(){
+stopDebate();
+history=[];
+current=0;
+document.getElementById("chat").innerHTML="";
+document.getElementById("timer").textContent=
+"00:00";
+document.getElementById("status").textContent=
+"会話を削除しました";
+}
+function finishDebate(){
+if(!running)return;
+running=false;
+if(controller){
+controller.abort();
+controller=null;
+}
+clearInterval(timerId);
+document.getElementById("status").textContent=
+"議論終了";
+if(!history.length)return;
+const summaryPerson={
+name:"議論まとめ",
+position:
+"中立的な司会者。議論全体を客観的に整理する。"
+};
+const topic=
+document.getElementById("topic").value;
+let prompt=
+`議題：
+${topic}
+議論内容：
+`;
+for(const h of history){
+prompt+=`\n${h.name}: ${h.text}`;
+}
+prompt+=`
+議論は終了しました。
+議論全体を客観的に分析してください。
+1. 主な論点
+2. 各参加者の主張
+3. 意見が一致した点
+4. 意見が対立した点
+5. 最も説得力のある主張
+6. 議論から導ける結論
+簡潔にまとめてください。`;
+const key=keys.find(x=>x.trim());
+ask(
+key,
+summaryPerson,
+prompt
+)
+.then(text=>{
+if(text){
+addMessage(
+"議論まとめ",
+text
+);
+}
+})
+.catch(e=>{
+if(e.name==="AbortError")return;
+addMessage(
+"SYSTEM",
+"まとめ生成エラー: "+e.message
+);
+});
+}
+load();
+</script>
+</body>
+</html>
